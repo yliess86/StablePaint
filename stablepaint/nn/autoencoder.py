@@ -2,14 +2,14 @@ from __future__ import annotations
 
 from lpips import LPIPS
 from torch import Tensor
-from torch.nn import (BatchNorm2d, Module, Parameter, Sequential)
+from torch.nn import (BatchNorm2d, Conv2d, Module, Parameter, Sequential)
 from typing import NamedTuple
-from .modules import (DepthWiseSeparableConv2d, DiagonalGaussianDistribution, Downsample, Identity, Norm, Swish, Upsample)
-from .utils import (Jitable, Loadable)
+from .modules import (DiagonalGaussianDistribution, Downsample, Identity, Norm, Swish, Upsample)
+from .utils import (Jitable, Loadable, scale)
 
 import torch
 import torch.nn.init as init
-import xformers.ops as xops
+import torch.nn.functional as F
 
 
 class AttentionBlock(Module):
@@ -17,8 +17,8 @@ class AttentionBlock(Module):
         super().__init__()
         self.n_heads, self.head_dim = n_heads, head_dim
         self.norm = Norm(dim)
-        self.qkv = DepthWiseSeparableConv2d(dim, 3 * n_heads * head_dim, 1, bias=False)
-        self.proj = DepthWiseSeparableConv2d(n_heads * head_dim, dim, 1)
+        self.qkv = Conv2d(dim, 3 * n_heads * head_dim, 1, bias=False)
+        self.proj = Conv2d(n_heads * head_dim, dim, 1)
 
     def forward(self, x: Tensor) -> Tensor:
         B, C, H, W = x.size()
@@ -26,7 +26,7 @@ class AttentionBlock(Module):
         q = q.reshape(B, C, H * W).permute(0, 2, 1).reshape(x.size(0), -1, self.n_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
         k = k.reshape(B, C, H * W).permute(0, 2, 1).reshape(x.size(0), -1, self.n_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
         v = v.reshape(B, C, H * W).permute(0, 2, 1).reshape(x.size(0), -1, self.n_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
-        h = xops.memory_efficient_attention(q, k, v, attn_bias=None, op=None)
+        h = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
         h = h.permute(0, 2, 1, 3).reshape(x.size(0), -1, self.n_heads * self.head_dim).permute(0, 2, 1).reshape(B, C, H, W)
         return self.proj(h) + x
 
@@ -34,89 +34,99 @@ class AttentionBlock(Module):
 class ResnetBlock(Module):
     def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
-        self.in_ = Sequential(Norm( in_channels), Swish(), DepthWiseSeparableConv2d( in_channels, out_channels, 3, 1, 1, bias=False))
-        self.out = Sequential(Norm(out_channels), Swish(), DepthWiseSeparableConv2d(out_channels, out_channels, 3, 1, 1, bias=False))
-        self.skip = DepthWiseSeparableConv2d(in_channels, out_channels, 1) if in_channels != out_channels else Identity
+        self.in_ = Sequential(Norm( in_channels), Swish(), Conv2d( in_channels, out_channels, 3, 1, 1, bias=False))
+        self.out = Sequential(Norm(out_channels), Swish(), Conv2d(out_channels, out_channels, 3, 1, 1, bias=False))
+        self.skip = Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else Identity
 
     def forward(self, x: Tensor) -> Tensor:
         return self.out(self.in_(x)) + self.skip(x)
 
 
 class Encoder(Sequential, Loadable, Jitable):
-    def __init__(self, in_channels: int = 3) -> None:
+    def __init__(self, in_channels: int = 3, t: float = 1.0) -> None:
         super().__init__(
-            DepthWiseSeparableConv2d(in_channels, 128, 3, 1, 1),
-            ResnetBlock(128, 128),
-            ResnetBlock(128, 128),
-            Downsample(128),
-            ResnetBlock(128, 256),
-            ResnetBlock(256, 256),
-            Downsample(256),
-            ResnetBlock(256, 512),
-            ResnetBlock(512, 512),
-            Downsample(512),
-            ResnetBlock(512, 512),
-            AttentionBlock(512, 8, 64),
-            ResnetBlock(512, 512),
-            Norm(512),
+            Conv2d(in_channels, scale(128, t), 3, 1, 1),
+            ResnetBlock(scale(128, t), scale(128, t)),
+            ResnetBlock(scale(128, t), scale(128, t)),
+            Downsample(scale(128, t)),
+            ResnetBlock(scale(128, t), scale(256, t)),
+            ResnetBlock(scale(256, t), scale(256, t)),
+            Downsample(scale(256, t)),
+            ResnetBlock(scale(256, t), scale(512, t)),
+            ResnetBlock(scale(512, t), scale(512, t)),
+            Downsample(scale(512, t)),
+            ResnetBlock(scale(512, t), scale(512, t)),
+            AttentionBlock(scale(512, t), 8, scale(512, t) // 8),
+            ResnetBlock(scale(512, t), scale(512, t)),
+            Norm(scale(512, t)),
             Swish(),
-            DepthWiseSeparableConv2d(512, 8, 3, 1, 1),
-            DepthWiseSeparableConv2d(8, 8, 1),
+            Conv2d(scale(512, t), 8, 3, 1, 1),
+            Conv2d(8, 8, 1),
         )
         self[-2].apply(self.init_weights)
         self.encode = lambda x: DiagonalGaussianDistribution(self(x))
 
     @torch.no_grad()
     def init_weights(self, module: Module) -> None:
-        if isinstance(module, DepthWiseSeparableConv2d):
-            init.constant_(module.point.weight.data, 0.0)
-            init.constant_(module.point.bias.data, 0.0)
+        if isinstance(module, Conv2d):
+            init.constant_(module.weight.data, 0.0)
+            init.constant_(module.bias.data, 0.0)
+
+    def load(self: Module, ckpt: dict[str, Tensor]) -> Module:
+        if self[0].weight.data.shape[1] > ckpt["0.weight"].data.shape[1]:
+            print(f"Input Channels Differs [{self[0].weight.data.shape[1]} > {ckpt['0.weight'].data.shape[1]}]")
+            print("Peforming Partial Initialisation...")
+            self[0].weight.data[:, :3] = ckpt["0.weight"].data[:, :3]
+            self[0].weight.data[:, -1] = ckpt["0.weight"].data[:, -1]
+            ckpt["0.weight"].data = self[0].weight.data
+        self.load_state_dict(ckpt, strict=False)
+        return self
 
 
 class Decoder(Sequential, Loadable, Jitable):
-    def __init__(self) -> None:
+    def __init__(self, t: float = 1.0) -> None:
         super().__init__(
-            DepthWiseSeparableConv2d(4, 4, 1),
-            DepthWiseSeparableConv2d(4, 512, 3, 1, 1),
-            ResnetBlock(512, 512),
-            AttentionBlock(512, 8, 64),
-            ResnetBlock(512, 512),
-            ResnetBlock(512, 512),
-            Upsample(512),
-            ResnetBlock(512, 512),
-            ResnetBlock(512, 512),
-            ResnetBlock(512, 512),
-            Upsample(512),
-            ResnetBlock(512, 256),
-            ResnetBlock(256, 256),
-            ResnetBlock(256, 256),
-            Upsample(256),
-            ResnetBlock(256, 128),
-            ResnetBlock(128, 128),
-            ResnetBlock(128, 128),
-            Norm(128),
+            Conv2d(4, 4, 1),
+            Conv2d(4, scale(512, t), 3, 1, 1),
+            ResnetBlock(scale(512, t), scale(512, t)),
+            AttentionBlock(scale(512, t), 8, scale(512, t) // 8),
+            ResnetBlock(scale(512, t), scale(512, t)),
+            ResnetBlock(scale(512, t), scale(512, t)),
+            Upsample(scale(512, t)),
+            ResnetBlock(scale(512, t), scale(512, t)),
+            ResnetBlock(scale(512, t), scale(512, t)),
+            ResnetBlock(scale(512, t), scale(512, t)),
+            Upsample(scale(512, t)),
+            ResnetBlock(scale(512, t), scale(256, t)),
+            ResnetBlock(scale(256, t), scale(256, t)),
+            ResnetBlock(scale(256, t), scale(256, t)),
+            Upsample(scale(256, t)),
+            ResnetBlock(scale(256, t), scale(128, t)),
+            ResnetBlock(scale(128, t), scale(128, t)),
+            ResnetBlock(scale(128, t), scale(128, t)),
+            Norm(scale(128, t)),
             Swish(),
-            DepthWiseSeparableConv2d(128, 3, 3, 1, 1),
+            Conv2d(scale(128, t), 3, 3, 1, 1),
         )
         self.decode = lambda z: self(z)
 
 
 class Discriminator(Sequential):
-    def __init__(self) -> None:
+    def __init__(self, t: float = 1.0) -> None:
         super().__init__(
-            DepthWiseSeparableConv2d(  3,  64, 3, 2, 1), Swish(),
-            DepthWiseSeparableConv2d( 64, 128, 3, 2, 1, bias=False), BatchNorm2d(128), Swish(),
-            DepthWiseSeparableConv2d(128, 256, 3, 2, 1, bias=False), BatchNorm2d(256), Swish(),
-            DepthWiseSeparableConv2d(256, 512, 3, 2, 1, bias=False), BatchNorm2d(512), Swish(),
-            DepthWiseSeparableConv2d(512, 512, 3, 2, 1, bias=False), BatchNorm2d(512), Swish(),
-            DepthWiseSeparableConv2d(512,   1, 3, 1, 1)
+            Conv2d(            3, scale( 64, t), 3, 2, 1), Swish(),
+            Conv2d(scale( 64, t), scale(128, t), 3, 2, 1, bias=False), BatchNorm2d(scale(128, t)), Swish(),
+            Conv2d(scale(128, t), scale(256, t), 3, 2, 1, bias=False), BatchNorm2d(scale(256, t)), Swish(),
+            Conv2d(scale(256, t), scale(512, t), 3, 2, 1, bias=False), BatchNorm2d(scale(512, t)), Swish(),
+            Conv2d(scale(512, t), scale(512, t), 3, 2, 1, bias=False), BatchNorm2d(scale(512, t)), Swish(),
+            Conv2d(scale(512, t),             1, 3, 1, 1)
         )
         self.apply(self.init_weights)
 
     @torch.no_grad()
     def init_weights(self, module: Module) -> None:
-        if isinstance(module, DepthWiseSeparableConv2d):
-            init.normal_(module.point.weight.data, 0.0, 0.02)
+        if isinstance(module, Conv2d):
+            init.normal_(module.weight.data, 0.0, 0.02)
         if isinstance(module, BatchNorm2d):
             init.normal_(module.weight.data, 1.0, 0.02)
             init.constant_(module.bias.data, 0.0)
@@ -129,12 +139,12 @@ class LPIPSWithDiscriminator(Module):
         disc_factor: float = 1.0
         perc       : float = 1.0
 
-    def __init__(self, weights: Weights, last: Parameter, start_disc: int = 0) -> None:
+    def __init__(self, last: Parameter, start_disc: int = 0, t: float = 1.0, weights: Weights = Weights()) -> None:
         super().__init__()
         self.weights = weights
         self.last = last
         self.start_disc = start_disc
-        self.disc = Discriminator()
+        self.disc = Discriminator(t=t)
         self.perc = LPIPS(net="vgg").eval()
         self.logvar = Parameter(torch.zeros(size=(), dtype=torch.float32, requires_grad=False))
 

@@ -7,7 +7,6 @@ from .utils import Loadable
 
 import torch
 import torch.nn.functional as F
-import xformers.ops as xops
 
 
 class ResBlock(Module):
@@ -31,14 +30,14 @@ class CrossAttention(Module):
         self.kv = Linear(dim, 2 * head_dim * n_heads, bias=False)
         self.out = Linear(head_dim * n_heads, dim)
 
-    def forward(self, x: Tensor, line: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, ctx: Tensor | None = None) -> Tensor:
         x = self.norm(x)
-        line = x if line is None else line
-        q, (k, v) = self.q(x), self.kv(line).chunk(2, dim=1)
+        ctx = x if ctx is None else ctx
+        q, (k, v) = self.q(x), self.kv(ctx).chunk(2, dim=1)
         q = q.reshape(x.size(0), -1, self.n_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
         k = k.reshape(x.size(0), -1, self.n_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
         v = v.reshape(x.size(0), -1, self.n_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
-        h = xops.memory_efficient_attention(q, k, v, attn_bias=None, op=None)
+        h = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
         h = h.permute(0, 2, 1, 3).reshape(x.size(0), -1, self.n_heads * self.head_dim)
         return self.out(h)
 
@@ -63,9 +62,9 @@ class TransformerBlock(Module):
         self.geglu = GeGLU(dim, dim * 4)
         self.out = Linear(dim * 4, dim)
 
-    def forward(self, x: Tensor, line: Tensor) -> Tensor:
+    def forward(self, x: Tensor, ctx: Tensor) -> Tensor:
         x = self.cross_1(x, None) + x
-        x = self.cross_2(x, line) + x
+        x = self.cross_2(x, ctx) + x
         x = self.out(self.geglu(x)) + x
         return x
 
@@ -73,16 +72,16 @@ class TransformerBlock(Module):
 class SpatialTransformer(Module):
     def __init__(self, channels: int, n_heads: int, head_dim: int) -> None:
         super().__init__()
-        self.line = Conv2d(4, channels, 1)
+        self.ctx = Conv2d(4 + 4, channels, 1)
         self.norm = Norm(channels)
         self.proj_in = Conv2d(channels, channels, 1)
         self.block = TransformerBlock(channels, n_heads, head_dim)
         self.proj_out = Conv2d(channels, channels, 1)
 
-    def forward(self, x: Tensor, line: Tensor) -> Tensor:
+    def forward(self, x: Tensor, ctx: Tensor) -> Tensor:
         B, C, H, W = x.size()
-        line = F.avg_pool2d(line, (line.size(-2) // H, line.size(-1) // W))
-        l = self.line(line).reshape(B, C, H * W).permute(0, 2, 1)
+        ctx = F.avg_pool2d(ctx, (ctx.size(-2) // H, ctx.size(-1) // W))
+        l = self.ctx(ctx).reshape(B, C, H * W).permute(0, 2, 1)
         h = self.proj_in(self.norm(x)).reshape(B, C, H * W).permute(0, 2, 1)
         h = self.block(h, l).permute(0, 2, 1).reshape(B, C, H, W)
         return self.proj_out(h) + x
@@ -135,22 +134,22 @@ class UNet(Module, Loadable):
         ])
         self.out = Sequential(Norm(64), Swish(), Conv2d(64, 4, 3, 1, 1))
 
-    def apply(self, modules: ModuleList, x: Tensor, t: Tensor, line: Tensor) -> Tensor:
+    def apply(self, modules: ModuleList, x: Tensor, t: Tensor, ctx: Tensor) -> Tensor:
         for module in modules:
             if isinstance(module, ResBlock): x = module(x, t)
-            elif isinstance(module, SpatialTransformer): x = module(x, line)
+            elif isinstance(module, SpatialTransformer): x = module(x, ctx)
             else: x = module(x)
         return x
 
-    def forward(self, x: Tensor, t: Tensor, line: Tensor) -> Tensor:
+    def forward(self, x: Tensor, t: Tensor, ctx: Tensor) -> Tensor:
         t = self.time_emb(self.pos_enc(t))
         residuals = []
         for modules in self.encoder:
-            x = self.apply(modules, x, t, line)
+            x = self.apply(modules, x, t, ctx)
             residuals.append(x)
-        x = self.apply(self.bottleneck, x, t, line)
+        x = self.apply(self.bottleneck, x, t, ctx)
         for modules in self.decoder:
             x = torch.cat((x, residuals.pop()), dim=1)
-            x = self.apply(modules, x, t, line)
+            x = self.apply(modules, x, t, ctx)
         x = self.out(x)
         return x

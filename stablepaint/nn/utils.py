@@ -6,9 +6,14 @@ from torch.jit import ScriptModule
 from tqdm import tqdm
 from typing import Protocol
 
+import numpy as np
 import torch
 import torch.jit as jit
 import torchinfo
+
+
+def scale(x: int, t: float) -> int:
+    return int(np.floor(x * t))
 
 
 class Loadable(Protocol):
