@@ -161,8 +161,8 @@ if args.stage == "noise_model":
         x, l, h = map(to, next(iter_batch))
 
         with torch.no_grad():
-            z_x = args.scale * DiagonalGaussianDistribution(illustration_encoder(torch.cat((x, l), dim=1))).sample()
-            z_l = args.scale * DiagonalGaussianDistribution(lineart_encoder(torch.cat((h, l), dim=1))).sample()
+            z_x = args.scale * DiagonalGaussianDistribution(illustration_encoder(torch.cat((x, l), dim=1))).mean
+            z_l = args.scale * DiagonalGaussianDistribution(lineart_encoder(torch.cat((h, l), dim=1))).mean
             t = t.random_(0, len(ddm) + 1)
             n = torch.randn_like(z_x)
             z_n = ddm.forward_diffusion(z_x, t, n)
@@ -207,6 +207,6 @@ if args.stage == "demo":
         h = torch.zeros_like(l).repeat(1, 4, 1, 1)
 
         corruption = int(args.corruption * len(ddm))
-        z_l = args.scale * DiagonalGaussianDistribution(encoder(torch.cat((h, l), dim=1))).sample()
+        z_l = args.scale * DiagonalGaussianDistribution(encoder(torch.cat((h, l), dim=1))).mean
         t = torch.full((args.batch_size,), corruption, device=device, dtype=torch.long)
         to_pil(decoder(denoise(ddm.forward_diffusion(z_l, t), t, z_l, h, corruption) / args.scale)).show()
