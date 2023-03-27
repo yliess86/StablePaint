@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import (as_completed, ProcessPoolExecutor)
 from itertools import chain
 from pathlib import Path
 from PIL import Image
@@ -62,4 +63,7 @@ class SketchDataset(Dataset):
 
     def prepare(self) -> None:
         if len(list(filter(lambda p: p.is_file(), self.cached_files))) != len(self.cached_files):
-            for idx in tqdm(range(len(self)), desc="Preparing Dataset"): self.prepare_file(idx)
+            with ProcessPoolExecutor() as executor:
+                jobs = [executor.submit(self.prepare_file, idx) for idx in range(len(self))]
+                for job in tqdm(as_completed(jobs), desc="Preparing Dataset", total=len(self)):
+                    job.result()

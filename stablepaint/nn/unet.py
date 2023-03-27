@@ -3,7 +3,7 @@ from __future__ import annotations
 from torch import Tensor
 from torch.nn import (Conv2d, GELU, LayerNorm, Linear, Module, ModuleList, Sequential)
 from .modules import (Downsample, Identity, Norm, Swish, Upsample)
-from .utils import Loadable
+from .utils import (Loadable, scale)
 
 import torch
 import torch.nn.functional as F
@@ -37,7 +37,8 @@ class CrossAttention(Module):
         q = q.reshape(x.size(0), -1, self.n_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
         k = k.reshape(x.size(0), -1, self.n_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
         v = v.reshape(x.size(0), -1, self.n_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
-        h = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
+        with torch.backends.cuda.sdp_kernel(enable_flash=False):
+            h = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
         h = h.permute(0, 2, 1, 3).reshape(x.size(0), -1, self.n_heads * self.head_dim)
         return self.out(h)
 
@@ -70,12 +71,12 @@ class TransformerBlock(Module):
 
 
 class SpatialTransformer(Module):
-    def __init__(self, channels: int, n_heads: int, head_dim: int) -> None:
+    def __init__(self, channels: int, n_heads: int) -> None:
         super().__init__()
         self.ctx = Conv2d(4 + 4, channels, 1)
         self.norm = Norm(channels)
         self.proj_in = Conv2d(channels, channels, 1)
-        self.block = TransformerBlock(channels, n_heads, head_dim)
+        self.block = TransformerBlock(channels, n_heads, channels // n_heads)
         self.proj_out = Conv2d(channels, channels, 1)
 
     def forward(self, x: Tensor, ctx: Tensor) -> Tensor:
@@ -99,40 +100,44 @@ class PositionalEncoding(Module):
 
 
 class UNet(Module, Loadable):
-    def __init__(self):
+    def __init__(self, t: float = 1.0):
         super().__init__()
-        self.pos_enc = PositionalEncoding(256)
-        self.time_emb = Sequential(Linear(256, 256), Swish(), Linear(256, 256))
+        h0, h1, h2 = map(lambda x: scale(x, t), (256, 512, 1_024))
+        self.pos_enc = PositionalEncoding(h2)
+        self.time_emb = Sequential(Linear(h2, h2), Swish(), Linear(h2, h2))
         self.encoder = ModuleList([
-            ModuleList([Conv2d(4, 64, 3, 1, 1)]),
-            ModuleList([ResBlock( 64,  64, 256), SpatialTransformer( 64, 8,  8)]),
-            ModuleList([ResBlock( 64,  64, 256), SpatialTransformer( 64, 8,  8)]),
-            ModuleList([Downsample( 64)]),
-            ModuleList([ResBlock( 64, 128, 256), SpatialTransformer(128, 8, 16)]),
-            ModuleList([ResBlock(128, 128, 256), SpatialTransformer(128, 8, 16)]),
-            ModuleList([Downsample(128)]),
-            ModuleList([ResBlock(128, 256, 256), SpatialTransformer(256, 8, 32)]),
-            ModuleList([ResBlock(256, 256, 256), SpatialTransformer(256, 8, 32)]),
-            ModuleList([Downsample(256)]),
-            ModuleList([ResBlock(256, 256, 256)]),
-            ModuleList([ResBlock(256, 256, 256)]),
+            ModuleList([Conv2d(4, h0, 3, 1, 1)]),
+            ModuleList([ResBlock(h0, h0, h2), SpatialTransformer(h0, 8)]),
+            ModuleList([ResBlock(h0, h0, h2), SpatialTransformer(h0, 8)]),
+            ModuleList([Downsample(h0)]),
+            ModuleList([ResBlock(h0, h1, h2), SpatialTransformer(h1, 8)]),
+            ModuleList([ResBlock(h1, h1, h2), SpatialTransformer(h1, 8)]),
+            ModuleList([Downsample(h1)]),
+            ModuleList([ResBlock(h1, h2, h2), SpatialTransformer(h2, 8)]),
+            ModuleList([ResBlock(h2, h2, h2), SpatialTransformer(h2, 8)]),
+            ModuleList([Downsample(h2)]),
+            ModuleList([ResBlock(h2, h2, h2)]),
+            ModuleList([ResBlock(h2, h2, h2)]),
         ])
-        self.bottleneck = ModuleList([ResBlock(256, 256, 256), SpatialTransformer(256, 8, 32), ResBlock(256, 256, 256)])
+        self.bottleneck = ModuleList([
+            ResBlock(h2, h2, h2), SpatialTransformer(h2, 8),
+            ResBlock(h2, h2, h2),
+        ])
         self.decoder = ModuleList([
-            ModuleList([ResBlock(256 + 256, 256, 256)]),
-            ModuleList([ResBlock(256 + 256, 256, 256)]),
-            ModuleList([ResBlock(256 + 256, 256, 256), Upsample(256)]),
-            ModuleList([ResBlock(256 + 256, 256, 256), SpatialTransformer(256, 8, 32)]),
-            ModuleList([ResBlock(256 + 256, 256, 256), SpatialTransformer(256, 8, 32)]),
-            ModuleList([ResBlock(256 + 128, 256, 256), SpatialTransformer(256, 8, 32), Upsample(256)]),
-            ModuleList([ResBlock(256 + 128, 128, 256), SpatialTransformer(128, 8, 16)]),
-            ModuleList([ResBlock(128 + 128, 128, 256), SpatialTransformer(128, 8, 16)]),
-            ModuleList([ResBlock( 64 + 128, 128, 256), SpatialTransformer(128, 8, 16), Upsample(128)]),
-            ModuleList([ResBlock( 64 + 128,  64, 256), SpatialTransformer( 64, 8,  8)]),
-            ModuleList([ResBlock( 64 +  64,  64, 256), SpatialTransformer( 64, 8,  8)]),
-            ModuleList([ResBlock( 64 +  64,  64, 256), SpatialTransformer( 64, 8,  8)]),
+            ModuleList([ResBlock(h2 + h2, h2, h2)]),
+            ModuleList([ResBlock(h2 + h2, h2, h2)]),
+            ModuleList([ResBlock(h2 + h2, h2, h2), Upsample(h2)]),
+            ModuleList([ResBlock(h2 + h2, h2, h2), SpatialTransformer(h2, 8)]),
+            ModuleList([ResBlock(h2 + h2, h2, h2), SpatialTransformer(h2, 8)]),
+            ModuleList([ResBlock(h2 + h1, h2, h2), SpatialTransformer(h2, 8), Upsample(h2)]),
+            ModuleList([ResBlock(h2 + h1, h1, h2), SpatialTransformer(h1, 8)]),
+            ModuleList([ResBlock(h1 + h1, h1, h2), SpatialTransformer(h1, 8)]),
+            ModuleList([ResBlock(h0 + h1, h1, h2), SpatialTransformer(h1, 8), Upsample(h1)]),
+            ModuleList([ResBlock(h0 + h1, h0, h2), SpatialTransformer(h0, 8)]),
+            ModuleList([ResBlock(h0 + h0, h0, h2), SpatialTransformer(h0, 8)]),
+            ModuleList([ResBlock(h0 + h0, h0, h2), SpatialTransformer(h0, 8)]),
         ])
-        self.out = Sequential(Norm(64), Swish(), Conv2d(64, 4, 3, 1, 1))
+        self.out = Sequential(Norm(h0), Swish(), Conv2d(h0, 4, 3, 1, 1))
 
     def apply(self, modules: ModuleList, x: Tensor, t: Tensor, ctx: Tensor) -> Tensor:
         for module in modules:

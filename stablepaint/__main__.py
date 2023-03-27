@@ -51,6 +51,8 @@ num_workers = os.cpu_count() // 2
 device, dtype = args.device, eval(f"torch.{args.dtype}")
 to = lambda x: x.to(device=device, dtype=dtype)
 
+interpolate = lambda x, scale_factor: torch.nn.functional.avg_pool2d(x, (scale_factor, scale_factor))
+
 
 if args.stage in ["illustration", "lineart"]:
     if args.stage == "illustration": hint_method = HintMethods.IDENTITY
@@ -131,82 +133,104 @@ if args.stage == "scale":
 
 
 if args.stage == "noise_model":
-    illustration_encoder: Encoder = to(Encoder(in_channels=4, t=args.t)).load(torch.load(f"logs/ckpts/{args.name}_illustration_encoder.pt"))
-    illustration_decoder: Decoder = to(Decoder(t=args.t)).load(torch.load(f"logs/ckpts/{args.name}_illustration_decoder.pt"))
-    lineart_encoder: Encoder = to(Encoder(in_channels=5, t=args.t)).load(torch.load(f"logs/ckpts/{args.name}_lineart_encoder.pt"))
+    print(f"Loading Autoencoders: logs/ckpts/{args.name}_illustration_[encoder|decoder].pt and logs/ckpts/{args.name}_lineart_[encoder].pt...")
+    x_encoder: Encoder = to(Encoder(in_channels=4, t=args.t)).load(torch.load(f"logs/ckpts/{args.name}_illustration_encoder.pt"))
+    l_encoder: Encoder = to(Encoder(in_channels=5, t=args.t)).load(torch.load(f"logs/ckpts/{args.name}_lineart_encoder.pt"))
+    decoder: Decoder = to(Decoder(t=args.t)).load(torch.load(f"logs/ckpts/{args.name}_illustration_decoder.pt"))
 
-    dataset = SketchDataset(f"dataset/{args.name}", args.sketch_size, args.crop_size, HintMethods.IDENTITY, train=True, jobs=num_workers)
+    hint_method = HintMethods.mix(HintMethods.IDENTITY, HintMethods.RANDOM, p=0.2)
+    dataset = SketchDataset(f"dataset/{args.name}", args.sketch_size, args.crop_size, hint_method, train=True, jobs=num_workers)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers, pin_memory=True, drop_last=True)
     iter_batch = cycle(loader)
 
-    unet: UNet = to(UNet())
+    unet: UNet = to(UNet(t=args.t))
     ddm: DDPM = to(DDPM(1_000, latent_linear_beta_schedule))
 
     optim = AdamW(unet.parameters(), lr=1e-3)
-    lr_scheduler = WarmupCosineDecayLR(optim, lr=1e-3, min_lr=1e-3 / 10, warmup_steps=int(5e-4 * args.steps), decay_steps=args.steps)
+    lr_scheduler = WarmupCosineDecayLR(optim, lr=1e-4, min_lr=1e-4 / 10, warmup_steps=int(5e-4 * args.steps), decay_steps=args.steps)
 
-    def denoise(z_t: Tensor, t: Tensor, z_l: Tensor, h: Tensor, start: int) -> Tensor:
-        ctx = torch.cat((z_l, interpolate(h, scale_factor=8)), dim=1)
+    def denoise(z_t: Tensor, t: Tensor, ctx: Tensor, start: int) -> Tensor:
         for i in tqdm(range(start, 1, -1), desc="Denoise"):
             t.fill_(i); z_t = ddm.backward_diffusion(unet(z_t, t.to(dtype=dtype), ctx), z_t, t)
         return z_t
 
-    m = torch.zeros(args.batch_size, device=device, dtype=dtype)
+    loss_history, lr_history = [], []
     t = torch.randint(0, len(ddm) + 1, (args.batch_size,), device=device, dtype=torch.long)
-    l = torch.ones((args.batch_size, ), device=device, dtype=dtype)[:, None, None, None]
-
-    interpolate = lambda x, scale_factor: torch.nn.functional.avg_pool2d(x, (scale_factor, scale_factor))
     pbar = tqdm(range(args.steps), desc="Train")
     for step in pbar:
-        x, l, h = map(to, next(iter_batch))
+        loss = 0.0
+        for _ in range(args.accumulate):
+            x, l, h = map(to, next(iter_batch))
 
-        with torch.no_grad():
-            z_x = args.scale * DiagonalGaussianDistribution(illustration_encoder(torch.cat((x, l), dim=1))).mean
-            z_l = args.scale * DiagonalGaussianDistribution(lineart_encoder(torch.cat((h, l), dim=1))).mean
-            t = t.random_(0, len(ddm) + 1)
-            n = torch.randn_like(z_x)
-            z_n = ddm.forward_diffusion(z_x, t, n)
-        
-        ctx = torch.cat((z_l, interpolate(h, scale_factor=8)), dim=1)
-        loss = F.mse_loss(unet(z_n, t.to(dtype=dtype), ctx), n, reduction="mean")
+            with torch.no_grad():
+                z_x = args.scale * DiagonalGaussianDistribution(x_encoder(torch.cat((x, l), dim=1))).sample()
+                z_l = args.scale * DiagonalGaussianDistribution(l_encoder(torch.cat((h, l), dim=1))).sample()
+                t, n = t.random_(0, len(ddm) + 1), torch.randn_like(z_x)
+                z_n = ddm.forward_diffusion(z_x, t, n)
+                ctx = torch.cat((z_l, interpolate(h, scale_factor=8)), dim=1)
+            
+            micro_loss = F.mse_loss(unet(z_n, t.to(dtype=dtype), ctx), n, reduction="mean")
+            micro_loss /= args.accumulate; micro_loss.backward()
 
-        loss.backward()
+            loss += micro_loss.item()
+
         torch.nn.utils.clip_grad_norm_(unet.parameters(), 0.5)
         lr_scheduler.update(step)
         optim.step()
         optim.zero_grad(set_to_none=True)
-        
-        pbar.set_postfix(loss=f"{loss.item():.2e}", lr=f"{lr_scheduler.compute(step):.2e}")
+        loss_history.append(loss)
+        lr_history.append(lr_scheduler.compute(step))
+
+        pbar.set_postfix(loss=f"{loss:.2e}", lr=f"{lr_scheduler.compute(step):.2e}")
 
         if step % args.log_every == 0:
-            with torch.inference_mode():
-                to_pil(illustration_decoder(denoise(torch.randn_like(z_x), t, z_l, h, len(ddm)) / args.scale)).save(f"logs/imgs/{args.name}_latent_noise_model_00.png")
-                to_pil(illustration_decoder(denoise(ddm.forward_diffusion(z_x, t.fill_(len(ddm) // 2), n), t, z_l, h, len(ddm) // 2) / args.scale)).save(f"logs/imgs/{args.name}_illustration_noise_model_50.png")
-                to_pil(illustration_decoder(denoise(ddm.forward_diffusion(z_l, t.fill_(len(ddm) // 2), n), t, z_l, h, len(ddm) // 2) / args.scale)).save(f"logs/imgs/{args.name}_lineart_noise_model_50.png")
+            select = lambda x: x[:min(32, len(x))]
 
+            print("Saving Image...")
+            with torch.inference_mode():
+                to_pil(torch.cat((
+                    decoder(denoise(ddm.forward_diffusion(select(z_l), select(t).fill_(int(0.750 * len(ddm)))), select(t), select(ctx), int(0.750 * len(ddm))) / args.scale),
+                    decoder(denoise(ddm.forward_diffusion(select(z_l), select(t).fill_(int(0.500 * len(ddm)))), select(t), select(ctx), int(0.500 * len(ddm))) / args.scale),
+                    decoder(denoise(ddm.forward_diffusion(select(z_l), select(t).fill_(int(0.250 * len(ddm)))), select(t), select(ctx), int(0.250 * len(ddm))) / args.scale),
+                    decoder(denoise(ddm.forward_diffusion(select(z_l), select(t).fill_(int(0.125 * len(ddm)))), select(t), select(ctx), int(0.125 * len(ddm))) / args.scale),
+                ), dim=0)).save(f"logs/imgs/{args.name}_latent_noise_model.png")
+            
+            print("Saving Checkpoint...")
             torch.save(unet.state_dict(), f"logs/ckpts/{args.name}_noise_model.pt")
 
+            print("Ploting History...")
+            import matplotlib.pyplot as plt
+            plt.subplot(2, 1, 1)
+            plt.plot(loss_history)
+            plt.subplot(2, 1, 2)
+            plt.plot(lr_history)
+            plt.draw()
+            plt.savefig("history.png")
+            
 
 if args.stage == "demo":
     with torch.inference_mode():
         encoder: Encoder = to(Encoder(in_channels=5, t=args.t)).load(torch.load(f"logs/ckpts/{args.name}_lineart_encoder.pt"))
         decoder: Decoder = to(Decoder(t=args.t)).load(torch.load(f"logs/ckpts/{args.name}_illustration_decoder.pt"))
-        unet: UNet = to(UNet()).load(torch.load(f"logs/ckpts/{args.name}_noise_model.pt"))
-        ddm: DDPM = to(DDIM(500, latent_linear_beta_schedule, 0.2))
+        unet: UNet = to(UNet(t=args.t)).load(torch.load(f"logs/ckpts/{args.name}_noise_model.pt"))
+        ddm: DDPM = to(DDPM(1_000, latent_linear_beta_schedule))
 
-        interpolate = lambda x, scale_factor: torch.nn.functional.avg_pool2d(x, (scale_factor, scale_factor))
-        def denoise(z_t: Tensor, t: Tensor, z_l: Tensor, h: Tensor, start: int) -> Tensor:
-            ctx = torch.cat((z_l, interpolate(h, scale_factor=8)), dim=1)
+        def denoise(z_t: Tensor, t: Tensor, ctx: Tensor, start: int) -> Tensor:
             for i in tqdm(range(start, 1, -1), desc="Denoise"):
                 t.fill_(i); z_t = ddm.backward_diffusion(unet(z_t, t.to(dtype=dtype), ctx), z_t, t)
             return z_t
 
         lineart = Image.open(args.lineart).convert("L")
-        l = F.interpolate(torch.from_numpy(np.array(lineart))[None, None], (args.crop_size * 2, args.crop_size * 2))
+        l = F.interpolate(torch.from_numpy(np.array(lineart))[None, None], (args.crop_size, args.crop_size))
         l = to((2.0 * l / 255.0 - 1.0).repeat(args.batch_size, 1, 1, 1))
-        h = torch.zeros_like(l).repeat(1, 4, 1, 1)
+        
+        hints = Image.open(args.hints).convert("RGBA")
+        h = F.interpolate(torch.from_numpy(np.array(hints)).permute(2, 0, 1)[None], (args.crop_size, args.crop_size))
+        h = to((h / 255.0).repeat(args.batch_size, 1, 1, 1))
+
+        z_l = args.scale * DiagonalGaussianDistribution(encoder(torch.cat((h, l), dim=1))).sample()
+        ctx = torch.cat((z_l, interpolate(h, scale_factor=8)), dim=1)
 
         corruption = int(args.corruption * len(ddm))
-        z_l = args.scale * DiagonalGaussianDistribution(encoder(torch.cat((h, l), dim=1))).mean
         t = torch.full((args.batch_size,), corruption, device=device, dtype=torch.long)
-        to_pil(decoder(denoise(ddm.forward_diffusion(z_l, t), t, z_l, h, corruption) / args.scale)).show()
+        to_pil(decoder(denoise(ddm.forward_diffusion(z_l, t), t, ctx, corruption) / args.scale)).show()

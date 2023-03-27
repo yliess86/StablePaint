@@ -44,23 +44,14 @@ class ResnetBlock(Module):
 
 class Encoder(Sequential, Loadable, Jitable):
     def __init__(self, in_channels: int = 3, t: float = 1.0) -> None:
+        h1, h2, h3 = map(lambda x: scale(x, t), (128, 256, 512))
         super().__init__(
-            Conv2d(in_channels, scale(128, t), 3, 1, 1),
-            ResnetBlock(scale(128, t), scale(128, t)),
-            ResnetBlock(scale(128, t), scale(128, t)),
-            Downsample(scale(128, t)),
-            ResnetBlock(scale(128, t), scale(256, t)),
-            ResnetBlock(scale(256, t), scale(256, t)),
-            Downsample(scale(256, t)),
-            ResnetBlock(scale(256, t), scale(512, t)),
-            ResnetBlock(scale(512, t), scale(512, t)),
-            Downsample(scale(512, t)),
-            ResnetBlock(scale(512, t), scale(512, t)),
-            AttentionBlock(scale(512, t), 8, scale(512, t) // 8),
-            ResnetBlock(scale(512, t), scale(512, t)),
-            Norm(scale(512, t)),
-            Swish(),
-            Conv2d(scale(512, t), 8, 3, 1, 1),
+            Conv2d(in_channels, h1, 3, 1, 1),
+            ResnetBlock(h1, h1), ResnetBlock(h1, h1), Downsample(h1),
+            ResnetBlock(h1, h2), ResnetBlock(h2, h2), Downsample(h2),
+            ResnetBlock(h2, h3), ResnetBlock(h3, h3), Downsample(h3),
+            ResnetBlock(h3, h3), AttentionBlock(h3, 8, h3 // 8), ResnetBlock(h3, h3),
+            Norm(h3), Swish(), Conv2d(h3, 8, 3, 1, 1),
             Conv2d(8, 8, 1),
         )
         self[-2].apply(self.init_weights)
@@ -85,41 +76,29 @@ class Encoder(Sequential, Loadable, Jitable):
 
 class Decoder(Sequential, Loadable, Jitable):
     def __init__(self, t: float = 1.0) -> None:
+        h1, h2, h3 = map(lambda x: scale(x, t), (128, 256, 512))
         super().__init__(
             Conv2d(4, 4, 1),
-            Conv2d(4, scale(512, t), 3, 1, 1),
-            ResnetBlock(scale(512, t), scale(512, t)),
-            AttentionBlock(scale(512, t), 8, scale(512, t) // 8),
-            ResnetBlock(scale(512, t), scale(512, t)),
-            ResnetBlock(scale(512, t), scale(512, t)),
-            Upsample(scale(512, t)),
-            ResnetBlock(scale(512, t), scale(512, t)),
-            ResnetBlock(scale(512, t), scale(512, t)),
-            ResnetBlock(scale(512, t), scale(512, t)),
-            Upsample(scale(512, t)),
-            ResnetBlock(scale(512, t), scale(256, t)),
-            ResnetBlock(scale(256, t), scale(256, t)),
-            ResnetBlock(scale(256, t), scale(256, t)),
-            Upsample(scale(256, t)),
-            ResnetBlock(scale(256, t), scale(128, t)),
-            ResnetBlock(scale(128, t), scale(128, t)),
-            ResnetBlock(scale(128, t), scale(128, t)),
-            Norm(scale(128, t)),
-            Swish(),
-            Conv2d(scale(128, t), 3, 3, 1, 1),
+            Conv2d(4, h3, 3, 1, 1),
+            ResnetBlock(h3, h3), AttentionBlock(h3, 8, h3 // 8), ResnetBlock(h3, h3), ResnetBlock(h3, h3),
+            Upsample(h3), ResnetBlock(h3, h3), ResnetBlock(h3, h3), ResnetBlock(h3, h3),
+            Upsample(h3), ResnetBlock(h3, h2), ResnetBlock(h2, h2), ResnetBlock(h2, h2),
+            Upsample(h2), ResnetBlock(h2, h1), ResnetBlock(h1, h1), ResnetBlock(h1, h1),
+            Norm(h1), Swish(), Conv2d(h1, 3, 3, 1, 1),
         )
         self.decode = lambda z: self(z)
 
 
 class Discriminator(Sequential):
     def __init__(self, t: float = 1.0) -> None:
+        h0, h1, h2, h3 = map(lambda x: scale(x, t), (64, 128, 256, 512))
         super().__init__(
-            Conv2d(            3, scale( 64, t), 3, 2, 1), Swish(),
-            Conv2d(scale( 64, t), scale(128, t), 3, 2, 1, bias=False), BatchNorm2d(scale(128, t)), Swish(),
-            Conv2d(scale(128, t), scale(256, t), 3, 2, 1, bias=False), BatchNorm2d(scale(256, t)), Swish(),
-            Conv2d(scale(256, t), scale(512, t), 3, 2, 1, bias=False), BatchNorm2d(scale(512, t)), Swish(),
-            Conv2d(scale(512, t), scale(512, t), 3, 2, 1, bias=False), BatchNorm2d(scale(512, t)), Swish(),
-            Conv2d(scale(512, t),             1, 3, 1, 1)
+            Conv2d(            3, h0, 3, 2, 1), Swish(),
+            Conv2d(h0, h1, 3, 2, 1, bias=False), BatchNorm2d(h1), Swish(),
+            Conv2d(h1, h2, 3, 2, 1, bias=False), BatchNorm2d(h2), Swish(),
+            Conv2d(h2, h3, 3, 2, 1, bias=False), BatchNorm2d(h3), Swish(),
+            Conv2d(h3, h3, 3, 2, 1, bias=False), BatchNorm2d(h3), Swish(),
+            Conv2d(h3,             1, 3, 1, 1)
         )
         self.apply(self.init_weights)
 
